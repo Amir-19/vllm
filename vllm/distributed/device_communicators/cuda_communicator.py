@@ -6,6 +6,8 @@ from typing import Optional, Union
 import torch
 from torch.distributed import ProcessGroup
 
+from vllm.distributed.device_communicators.pynccl_allocator import (
+    is_symmetric_memory_enabled)
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -13,6 +15,38 @@ from vllm.platforms import current_platform
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+
+def register_nccl_symmetric_ops(pynccl_comm):
+    from vllm.distributed.device_communicators.pynccl_allocator import (
+        use_symmetric_memory,how_symmetric_memory_registered)
+    from vllm.utils import direct_register_custom_op
+
+    def all_reduce_symmetric_with_copy_impl(
+        input_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        with use_symmetric_memory(pynccl_comm) as sm:
+            symm_input = torch.empty_like(input_tensor)
+            symm_output = torch.empty_like(input_tensor)
+            sm.tag(symm_input)
+            sm.tag(symm_output)
+        print("symm regis",how_symmetric_memory_registered(symm_input),how_symmetric_memory_registered(symm_output))
+        symm_input.copy_(input_tensor)
+        symm_output = pynccl_comm.all_reduce(symm_input, symm_output)
+        return symm_output
+
+
+    def all_reduce_symmetric_with_copy_fake(
+        input_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.empty_like(input_tensor)
+
+    direct_register_custom_op(
+        op_name="all_reduce_symmetric_with_copy",
+        op_func=all_reduce_symmetric_with_copy_impl,
+        mutates_args=[],
+        fake_impl=all_reduce_symmetric_with_copy_fake,
+    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -53,6 +87,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group=self.cpu_group,
                 device=self.device,
             )
+        register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: Optional[CustomAllreduce] = None
         self.qr_comm: Optional[QuickAllReduce] = None
@@ -100,6 +135,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 raise ValueError(f"Unknown all2all backend: {all2all_backend}")
 
     def all_reduce(self, input_):
+        # since currently we perform copy input -> symm_input -> out-of-place AR
+        # return symm_output, we don't need to check if input is symmetric
+        if (
+            self.pynccl_comm is not None
+            and is_symmetric_memory_enabled()
+        ):
+            out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
+            if out is not None:
+                return out
+
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
