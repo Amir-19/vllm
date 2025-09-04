@@ -37,7 +37,7 @@ def register_nccl_symmetric_ops(pynccl_comm):
             symm_output = torch.empty_like(input_tensor)
             sm.tag(symm_input)
             sm.tag(symm_output)
-        print("symm regis",how_symmetric_memory_registered(symm_input),how_symmetric_memory_registered(symm_output))
+        #print("symm regis",how_symmetric_memory_registered(symm_input),how_symmetric_memory_registered(symm_output))
         symm_input.copy_(input_tensor)
         symm_output = pynccl_comm.all_reduce(symm_input, symm_output)
         return symm_output
