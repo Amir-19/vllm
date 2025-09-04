@@ -3,6 +3,7 @@ import tempfile
 
 import torch
 from torch.cuda.memory import CUDAPluggableAllocator
+from torch.utils.cpp_extension import load_inline
 
 from vllm import envs
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -65,7 +66,7 @@ def get_nccl_mem_pool():
         try: 
             out_dir = tempfile.gettempdir()
             nccl_allocator_libname = "nccl_allocator"
-            torch.utils.cpp_extension.load_inline(
+            load_inline(
                 name=nccl_allocator_libname,
                 cpp_sources=nccl_allocator_source,
                 with_cuda=True,
