@@ -116,8 +116,8 @@ class use_symmetric_memory:
             self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
             self.is_graph_capture = torch.cuda.is_current_stream_capturing()
             self.device = torch.cuda.current_device()
-            self.pre_2_8_0 = version.parse(torch.__version__) < version.parse(
-                "2.8.0"
+            self.pre_2_8_0 = version.parse(torch.__version__) <= version.parse(
+                "2.7"
             )
         self.disable_war = disable_war
 

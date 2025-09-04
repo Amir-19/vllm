@@ -17,10 +17,17 @@ from .base_device_communicator import DeviceCommunicatorBase
 logger = init_logger(__name__)
 
 
+_NCCL_SYMM_OPS_REGISTERED = False
+
 def register_nccl_symmetric_ops(pynccl_comm):
     from vllm.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,how_symmetric_memory_registered)
     from vllm.utils import direct_register_custom_op
+
+    global _NCCL_SYMM_OPS_REGISTERED
+    if _NCCL_SYMM_OPS_REGISTERED:
+        return
+    _NCCL_SYMM_OPS_REGISTERED = True
 
     def all_reduce_symmetric_with_copy_impl(
         input_tensor: torch.Tensor
