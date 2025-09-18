@@ -52,6 +52,38 @@ class BasePattern:
         self.tp_size = get_tensor_model_parallel_world_size()
 
 
+class GEMMAllReducePattern(BasePattern):
+    
+    def get_inputs(self):
+        input_tensor = torch.empty([16, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 8], device=self.device, dtype=self.dtype)
+        return [input_tensor, weight]
+    
+    def register(self, pm_pass: PatternMatcherPass):
+        def pattern(input_tensor: torch.Tensor, weight: torch.Tensor):
+            # Match: GEMM -> All-Reduce
+            mm = torch.ops.aten.mm.default(input_tensor, weight)
+            all_reduce = torch.ops.vllm.all_reduce.default(
+                mm, group_name=self.tp.unique_name
+            )
+            return all_reduce
+        
+        def replacement(input_tensor: torch.Tensor, weight: torch.Tensor):
+            # DEBUG: Just log that we found the pattern, then do original ops
+            logger.info("🎯 FOUND GEMM+AllReduce pattern! Input shape: %s, Weight shape: %s", 
+                       input_tensor.shape, weight.shape)
+            
+            # Do the original operations (no actual fusion)
+            mm = torch.ops.aten.mm.default(input_tensor, weight)
+            all_reduce = torch.ops.vllm.all_reduce.default(
+                mm, group_name=self.tp.unique_name
+            )
+            return all_reduce
+        
+        pm_pass.register_replacement(pattern, replacement, self.get_inputs(),
+                               pm_pass.fwd_only, pm_pass)
+        
+
 class GEMMReduceScatterPattern(BasePattern):
 
     def get_inputs(self):
@@ -1067,6 +1099,43 @@ class AllReduceFusedAddRMSNormStaticQuantNVFP4Pattern(BasePattern):
         pm.register_replacement(pattern, replacement, get_inputs(),
                                 pm.fwd_only, pm_pass)
 
+class GEMMAllReduceFusionPass(VllmInductorPass):
+    def __init__(self, config: VllmConfig):
+        super().__init__(config)
+        logger.info("🔧 Initializing GEMMAllReduceFusionPass")
+        self.disabled = True
+        self.tp_size = get_tensor_model_parallel_world_size()
+        logger.info("🔧 TP size: %s", self.tp_size)
+        if self.tp_size <= 1:
+            logger.info("🔧 TP size <= 1, disabling pass")
+            return
+        self.patterns: PatternMatcherPass = PatternMatcherPass(
+            pass_name="gemm_all_reduce_pass")
+        if config.model_config is None:
+            return
+        self.hidden_dim = config.model_config.get_hidden_size()
+        self.group = get_tp_group().device_group
+        rank = get_tensor_model_parallel_rank()
+        self.register_patterns()
+        logger.info("🔧 GEMMAllReduceFusionPass initialized successfully")
+    
+    @enable_fake_mode
+    def register_patterns(self):
+        GEMMAllReducePattern(self.model_dtype,
+                              self.device).register(self.patterns)
+        self.disabled = False
+
+    def __call__(self, graph: fx.Graph):
+        logger.info("🔧 GEMMAllReduceFusionPass called on graph")
+        if self.disabled:
+            logger.info("🔧 GEMMAllReduceFusionPass is disabled, skipping")
+            return
+        self.begin()
+        self.dump_graph(graph, "gemm_all_reduce_pass")
+        count = self.patterns.apply(graph)
+        logger.debug("Replaced %s patterns", count)
+        self.dump_graph(graph, "gemm_all_reduce_pass")
+        self.end_and_log()
 
 class AllReduceFusionPass(VllmInductorPass):
 

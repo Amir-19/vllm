@@ -13,7 +13,7 @@ if current_platform.is_cuda_alike():
     from .fusion_attn import AttnFusionPass
 
 if current_platform.is_cuda():
-    from .collective_fusion import AllReduceFusionPass, AsyncTPPass
+    from .collective_fusion import AllReduceFusionPass, AsyncTPPass, GEMMAllReduceFusionPass
 
 from .fix_functionalization import FixFunctionalizationPass
 from .inductor_pass import CustomGraphPass, InductorPass, get_pass_context
@@ -52,6 +52,7 @@ class PostGradPassManager(CustomGraphPass):
         self.fix_functionalization(graph)
 
     def configure(self, config: VllmConfig):
+        logger.info("🔧 Configuring PostGradPassManager...")
         self.pass_config = config.compilation_config.pass_config
         if self.pass_config.enable_noop:
             self.passes += [NoOpEliminationPass(config)]
@@ -69,7 +70,11 @@ class PostGradPassManager(CustomGraphPass):
             self.passes += [AttnFusionPass(config)]
         if self.pass_config.enable_fi_allreduce_fusion:
             self.passes += [AllReduceFusionPass(config)]
+        if current_platform.is_cuda():
+            logger.info("🔧 Adding GEMMAllReduceFusionPass...")
+            self.passes += [GEMMAllReduceFusionPass(config)]
         self.fix_functionalization = FixFunctionalizationPass(config)
+        logger.info("🔧 PostGradPassManager configured with %d passes", len(self.passes))
 
     def add(self, pass_: InductorPass):
         assert isinstance(pass_, InductorPass)
