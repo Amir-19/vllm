@@ -52,6 +52,64 @@ class BasePattern:
         self.tp_size = get_tensor_model_parallel_world_size()
 
 
+class GEMMAllReducePattern(BasePattern):
+    """
+    Pattern to match: apply_w8a8_block_fp8_linear -> all_reduce
+    This is the pattern from RowParallelLinear with block FP8 quantization.
+    """
+
+    def get_inputs(self):
+        # Setup inputs for block FP8 linear
+        input_tensor = torch.empty([16, 256], device=self.device, dtype=self.dtype)
+        weight = torch.empty([512, 256], device=self.device, dtype=FP8_DTYPE)
+        block_size = [128, 128]
+        weight_scale = torch.empty([512, 2], device=self.device, dtype=torch.float32)
+        
+        return [input_tensor, weight, block_size, weight_scale]
+
+    def register(self, pm_pass: PatternMatcherPass):
+        def pattern(input_tensor: torch.Tensor, weight: torch.Tensor,
+                   block_size: list[int], weight_scale: torch.Tensor):
+            # Match: apply_w8a8_block_fp8_linear -> all_reduce
+            block_fp8_linear = torch.ops.vllm.apply_w8a8_block_fp8_linear(
+                input=input_tensor,
+                weight=weight,
+                block_size=block_size,
+                weight_scale=weight_scale,
+                input_scale=None,
+                bias=None,
+            )
+            all_reduce = torch.ops.vllm.all_reduce.default(
+                block_fp8_linear, group_name=self.tp.unique_name
+            )
+            return all_reduce
+
+        def replacement(input_tensor: torch.Tensor, weight: torch.Tensor,
+                       block_size: list[int], weight_scale: torch.Tensor):
+            # DEBUG: Just log that we found the pattern, then do original ops
+            logger.info("🎯 FOUND apply_w8a8_block_fp8_linear + AllReduce pattern!")
+            logger.info("   Input shape: %s, Weight shape: %s, Block size: %s", 
+                       input_tensor.shape, weight.shape, block_size)
+
+            # Do the original operations (no actual fusion)
+            block_fp8_linear = torch.ops.vllm.apply_w8a8_block_fp8_linear(
+                input=input_tensor,
+                weight=weight,
+                block_size=block_size,
+                weight_scale=weight_scale,
+                input_scale=None,
+                bias=None,
+            )
+            all_reduce = torch.ops.vllm.all_reduce.default(
+                block_fp8_linear, group_name=self.tp.unique_name
+            )
+            return all_reduce
+
+        pm_pass.register_replacement(pattern, replacement, self.get_inputs(),
+                               pm_pass.fwd_only, pm_pass)
+
+
+
 class GEMMReduceScatterPattern(BasePattern):
 
     def get_inputs(self):
@@ -1186,3 +1244,42 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         if flashinfer_comm is not None:
             flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
                 self.ipc_handles, self.group)
+
+
+class GEMMAllReduceFusionPass(VllmPatternMatcherPass):
+    def __init__(self, config: VllmConfig):
+        super().__init__(config)
+        logger.info("🔧 Initializing GEMMAllReduceFusionPass")
+        self.disabled = True
+        self.tp_size = get_tensor_model_parallel_world_size()
+        logger.info("🔧 TP size: %s", self.tp_size)
+        if self.tp_size <= 1:
+            logger.info("🔧 TP size <= 1, disabling pass")
+            return
+        self.patterns: PatternMatcherPass = PatternMatcherPass(
+            pass_name="gemm_all_reduce_pass")
+        if config.model_config is None:
+            return
+        self.hidden_dim = config.model_config.get_hidden_size()
+        self.group = get_tp_group().device_group
+        rank = get_tensor_model_parallel_rank()
+        self.register_patterns()
+        logger.info("🔧 GEMMAllReduceFusionPass initialized successfully")
+
+    @enable_fake_mode
+    def register_patterns(self):
+        GEMMAllReducePattern(self.model_dtype,
+                              self.device).register(self.patterns)
+        self.disabled = False
+
+    def __call__(self, graph: fx.Graph):
+        logger.info("🔧 GEMMAllReduceFusionPass called on graph")
+        if self.disabled:
+            logger.info("🔧 GEMMAllReduceFusionPass is disabled, skipping")
+            return
+        self.begin()
+        self.dump_graph(graph, "gemm_all_reduce_pass")
+        count = self.patterns.apply(graph)
+        logger.debug("Replaced %s patterns", count)
+        self.dump_graph(graph, "gemm_all_reduce_pass")
+        self.end_and_log()
